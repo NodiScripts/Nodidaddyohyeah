@@ -1,0 +1,164 @@
+-- Records for 120 seconds, then copies the captured log.
+-- Run this before manually performing the trade steps.
+
+local RECORD_SECONDS = 120
+
+assert(
+    type(hookmetamethod) == "function"
+    and type(getnamecallmethod) == "function"
+    and type(setclipboard) == "function",
+    "This environment does not support the required recording/clipboard APIs."
+)
+
+local HttpService = game:GetService("HttpService")
+local remotes = workspace:WaitForChild("__REMOTES", 10)
+assert(remotes, "workspace.__REMOTES was not found.")
+
+local gameRemotes = remotes:WaitForChild("Game", 10)
+assert(gameRemotes, "__REMOTES.Game was not found.")
+
+local trading = gameRemotes:WaitForChild("Trading", 10)
+assert(trading, "Game.Trading was not found.")
+
+local active = true
+local entries = {}
+local connections = {}
+local started = os.clock()
+local sequence = 0
+
+local function serialize(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+
+    local kind = typeof(value)
+    if kind == "nil" then
+        return { type = "nil" }
+    elseif kind == "string" or kind == "boolean" then
+        return value
+    elseif kind == "number" then
+        if value ~= value or math.abs(value) == math.huge then
+            return tostring(value)
+        end
+        return value
+    elseif kind == "Instance" then
+        return {
+            type = "Instance",
+            class = value.ClassName,
+            path = value:GetFullName(),
+        }
+    elseif kind ~= "table" then
+        return { type = kind, value = tostring(value) }
+    end
+
+    if seen[value] then
+        return "<cycle>"
+    end
+    if depth >= 8 then
+        return "<depth limit>"
+    end
+
+    seen[value] = true
+    local output = {}
+    local count = 0
+
+    for key, item in pairs(value) do
+        count += 1
+        if count > 300 then
+            output[#output + 1] = { truncated = true }
+            break
+        end
+        output[#output + 1] = {
+            key = serialize(key, depth + 1, seen),
+            value = serialize(item, depth + 1, seen),
+        }
+    end
+
+    seen[value] = nil
+    return output
+end
+
+local function record(kind, remote, values, callId)
+    if not active then
+        return
+    end
+
+    entries[#entries + 1] = {
+        time = math.round((os.clock() - started) * 1000) / 1000,
+        kind = kind,
+        remote = remote:GetFullName(),
+        callId = callId,
+        values = serialize(values),
+    }
+end
+
+local function watch(remote)
+    if remote:IsA("RemoteEvent") then
+        connections[#connections + 1] =
+            remote.OnClientEvent:Connect(function(...)
+                record("incoming_event", remote, table.pack(...))
+            end)
+    end
+end
+
+for _, remote in ipairs(gameRemotes:GetDescendants()) do
+    watch(remote)
+end
+
+connections[#connections + 1] =
+    gameRemotes.DescendantAdded:Connect(watch)
+
+local original
+original = hookmetamethod(game, "__namecall", function(self, ...)
+    local method = getnamecallmethod()
+
+    if not active or self ~= trading
+        or (method ~= "InvokeServer" and method ~= "FireServer") then
+        return original(self, ...)
+    end
+
+    sequence += 1
+    local callId = sequence
+    record("outgoing_" .. method, self, table.pack(...), callId)
+
+    local results = table.pack(pcall(original, self, ...))
+
+    if not results[1] then
+        record("error", self, table.pack(results[2]), callId)
+        error(results[2], 0)
+    end
+
+    local returned = { n = results.n - 1 }
+    for i = 2, results.n do
+        returned[i - 1] = results[i]
+    end
+
+    record("returned", self, returned, callId)
+    return table.unpack(results, 2, results.n)
+end)
+
+local function finish()
+    if not active then
+        return
+    end
+
+    active = false
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+
+    local ok, err = pcall(function()
+        setclipboard(HttpService:JSONEncode({
+            duration = os.clock() - started,
+            entries = entries,
+        }))
+    end)
+
+    if ok then
+        warn("Trade recorder finished: log copied to clipboard.")
+    else
+        warn("Clipboard export failed: " .. tostring(err))
+    end
+end
+
+task.delay(RECORD_SECONDS, finish)
+warn("Trade recorder running for " .. RECORD_SECONDS .. " seconds.")
